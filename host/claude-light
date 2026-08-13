@@ -12,7 +12,7 @@ stdin 收到 hook JSON（含 hook_event_name / tool_response.is_error）。
   PostToolUseFailure   -> error 红灯闪烁（工具调用失败）
   PermissionRequest    -> wait  黄灯闪烁（等待用户确认）
   Notification         -> wait  黄灯闪烁（需要用户注意）
-  SubagentStop         -> work  黄灯常亮（子代理结束，继续处理）
+  SubagentStop         -> 忽略（见下方注释；映射 work 会把空闲绿灯打回黄灯）
   Stop                 -> idle  绿灯常亮（轮次结束恒绿；错误只在发生当下闪红）
   SessionEnd           -> bye   绿灯长周期呼吸（对话结束）
 """
@@ -103,7 +103,11 @@ def main():
         if 'permission' in raw:
             cmd = 'wait'
     elif event == 'SubagentStop':
-        cmd = 'work'
+        # 忽略，不点灯（2026-08-13 真机排查）：回合结束几分钟后 CC 内部会补发
+        # SubagentStop（payload 无 agent_type，疑后台摘要机制），若映射 work 会把
+        # Stop 点亮的空闲绿灯打回黄灯，表现为「灯卡住不灭」。子代理运行期间本就
+        # 有 PreToolUse/PostToolUse 维持黄灯，忽略它不影响任何正常灯效。
+        pass
     elif event == 'Stop':
         # 轮次结束恒为绿灯：错误只在发生当下闪红（PostToolUseFailure/is_error），
         # 错误标记仍保留给监控台徽标，由 UserPromptSubmit 清除
