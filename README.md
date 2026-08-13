@@ -10,7 +10,7 @@ MIT 协议，纯 Python 标准库 + Arduino 固件，无第三方运行时依赖
 |---|---|---|---|
 | 红黄绿同闪一下 → 绿灯常亮 | 新对话开始 | `SessionStart` | `session.created` |
 | 黄灯常亮 | 正在处理/思考/改文件/执行命令 | `UserPromptSubmit`、`PreToolUse`、`PostToolUse` | `message.updated`、`message.part.updated`、`command.executed` |
-| 黄灯闪烁 | 等待用户确认或回复 | `PermissionRequest`、`Notification` | `permission.ask` |
+| 黄灯闪烁 | 等待用户确认或回复 | `PermissionRequest`、`Notification`（仅权限类，其余通知忽略） | `permission.ask` |
 | 红灯闪烁 | 出错（仅错误发生当下闪红） | `PostToolUseFailure`、`tool_response.is_error` | `session.error` |
 | 绿灯常亮 | 处理完成、空闲 | `Stop` | `session.idle` |
 | 绿灯长周期呼吸 | 对话结束 | `SessionEnd` | `dispose`、`session.deleted` |

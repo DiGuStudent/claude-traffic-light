@@ -97,7 +97,11 @@ def main():
     elif event == 'PermissionRequest':
         cmd = 'wait'
     elif event == 'Notification':
-        cmd = 'wait'
+        # 通知语义宽泛：任务结束后的「等待关注」类通知若映射为黄闪会覆盖
+        # 正确的绿灯。只有权限类通知（真正需要确认）才亮黄闪，其余忽略。
+        raw = json.dumps(data, ensure_ascii=False).lower() if data else ''
+        if 'permission' in raw:
+            cmd = 'wait'
     elif event == 'SubagentStop':
         cmd = 'work'
     elif event == 'Stop':
