@@ -46,6 +46,7 @@ state = {
     'board_fx': None,     # 板子上报的灯效（解析 STATUS）
     'board_wifi': None,   # 板子 WiFi IP（解析 STATUS / UDP ready）
     'serial_open': False,
+    'serial_rx_t': None,  # 最近一次从串口收到板子数据的时刻（None=该链路从未被板子确认）
     'udp_active': False,  # 配置了 IP 且成功发过包
     'start_t': time.time(),
 }
@@ -127,6 +128,7 @@ class SerialLink:
             try:
                 self.fd = self._open()
                 state['serial_open'] = True
+                state['serial_rx_t'] = None  # 新链路，需板子应答后才算确认
                 log(f"serial open {cfg['SERIAL']}@{cfg['BAUD']}")
                 # 板子可能刚复位，稍后查询一次状态填充监控台
                 threading.Thread(target=self._startup_status, daemon=True).start()
@@ -195,6 +197,7 @@ class SerialLink:
                                 log(f'rx: {last_line} (×{repeat} 重复)')
                             last_line, repeat, last_flush = line, 1, now
                             log('rx: ' + line)
+                            state['serial_rx_t'] = time.time()  # 串口有数据＝板子挂在该链路上
                             process_board_line(line)
                     else:
                         raise OSError('EOF')
@@ -243,13 +246,23 @@ def udp_read_loop():
             time.sleep(1)
 
 
+SERIAL_CONFIRM_WINDOW = 30  # 串口在多少秒内有过应答才算「板子确实挂在串口上」
+
 def dispatch(cmd, src='cmd'):
-    """转发命令到板子：串口优先（低延迟、可回读 ACK），串口不可用时 UDP 兜底"""
+    """转发命令到板子：串口优先（低延迟、可回读 ACK），
+    串口写入失败或板子久未在串口上应答时，用 UDP 兜底（板子可能已切到 WiFi）。"""
     log(f'{src}: {cmd}')
     state['last_cmd'] = cmd
     state['last_t'] = time.strftime('%H:%M:%S')
     if not serial.send(cmd):
         udp_send(cmd)
+    else:
+        rx_t = state.get('serial_rx_t')
+        if rx_t is None or time.time() - rx_t > SERIAL_CONFIRM_WINDOW:
+            # fd 能写 ≠ 板子真在这条串口上（例：FTDI 换口/接线松动后一直静默）。
+            # 此时仍补发 UDP，保证 WiFi 通道下的板子一定能收到命令。
+            udp_send(cmd)
+            log('serial silent, also sent via udp')
 
 
 # ---------- unix socket（hook 入口用） ----------
