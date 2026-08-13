@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Claude Code hook 入口：把 hook 事件翻译成红绿灯命令，发给 claude-lightd。
+
+stdin 收到 hook JSON（含 hook_event_name / tool_response.is_error）。
+可选参数覆盖事件名，方便手动测试：claude-light error
+
+状态映射：
+  SessionStart         -> new   三灯同闪一下 → 绿灯常亮（新对话开始）
+  UserPromptSubmit     -> work  黄灯常亮（开始处理），并清除本轮错误标记
+  PreToolUse           -> work  黄灯常亮（正在处理）
+  PostToolUse          -> work  黄灯常亮；若 tool_response.is_error -> error 红灯闪烁
+  PostToolUseFailure   -> error 红灯闪烁（工具调用失败）
+  PermissionRequest    -> wait  黄灯闪烁（等待用户确认）
+  Notification         -> wait  黄灯闪烁（需要用户注意）
+  SubagentStop         -> work  黄灯常亮（子代理结束，继续处理）
+  Stop                 -> idle  绿灯常亮（轮次结束恒绿；错误只在发生当下闪红）
+  SessionEnd           -> bye   绿灯长周期呼吸（对话结束）
+"""
+import json
+import os
+import socket
+import sys
+import time
+
+RUN_DIR = os.path.expanduser('~/.cache/claude-light')
+SOCK_PATH = os.path.join(RUN_DIR, 'ctl.sock')
+HOOK_LOG = os.path.join(RUN_DIR, 'hooks.log')
+AGENT = 'claude'  # 错误标记按 agent 隔离：err.<agent>
+
+
+def err_flag(agent=None):
+    return os.path.join(RUN_DIR, 'err.' + (agent or AGENT))
+
+
+def send(cmd):
+    """发给 daemon，失败静默（daemon 未启动时灯就不亮，不影响宿主程序）"""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(SOCK_PATH)
+        s.sendall(cmd.encode())
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def set_err(on, agent=None):
+    try:
+        if on:
+            open(err_flag(agent), 'w').close()
+        else:
+            os.unlink(err_flag(agent))
+    except OSError:
+        pass
+
+
+def main():
+    global AGENT
+    args = sys.argv[1:]
+    if args and args[0] == '--agent' and len(args) > 1:
+        AGENT = args[1]
+        args = args[2:]
+    event = args[0] if args else None
+    try:
+        data = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+    except (ValueError, OSError):
+        data = {}
+    if not event:
+        event = data.get('hook_event_name', '')
+
+    cmd = None
+    KNOWN = {'SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse',
+             'PostToolUse', 'PostToolUseFailure', 'PermissionRequest',
+             'Notification', 'SubagentStop', 'Stop'}
+    if event and event not in KNOWN:
+        # 参数不是已知事件名时，当作原始灯效命令直发（手动操控/配 WiFi 用）
+        cmd = event
+    elif event == 'SessionStart':
+        cmd = 'new'
+    elif event == 'SessionEnd':
+        cmd = 'bye'
+    elif event == 'UserPromptSubmit':
+        set_err(False)
+        cmd = 'work'
+    elif event == 'PreToolUse':
+        cmd = 'work'
+    elif event == 'PostToolUse':
+        if (data.get('tool_response') or {}).get('is_error'):
+            set_err(True)
+            cmd = 'error'
+        else:
+            cmd = 'work'
+    elif event == 'PostToolUseFailure':
+        set_err(True)
+        cmd = 'error'
+    elif event == 'PermissionRequest':
+        cmd = 'wait'
+    elif event == 'Notification':
+        cmd = 'wait'
+    elif event == 'SubagentStop':
+        cmd = 'work'
+    elif event == 'Stop':
+        # 轮次结束恒为绿灯：错误只在发生当下闪红（PostToolUseFailure/is_error），
+        # 错误标记仍保留给监控台徽标，由 UserPromptSubmit 清除
+        cmd = 'idle'
+
+    if cmd:
+        send(cmd)
+        try:
+            with open(HOOK_LOG, 'a') as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {AGENT} {event} -> {cmd}\n")
+        except OSError:
+            pass
+
+
+if __name__ == '__main__':
+    main()

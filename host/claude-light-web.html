@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude 状态灯 · 监控台</title>
+<style>
+body {
+  --page: #f9f9f7; --card: #fcfcfb;
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #898781;
+  --grid: #e1e0d9; --border: rgba(11,11,11,.12);
+  --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+  background: var(--page); color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  margin: 0; padding: 24px 16px 48px;
+}
+@media (prefers-color-scheme: dark) {
+  body {
+    --page: #0d0d0d; --card: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #898781;
+    --grid: #2c2c2a; --border: rgba(255,255,255,.12);
+  }
+}
+.wrap { max-width: 680px; margin: 0 auto; }
+h1 { font-size: 17px; font-weight: 600; margin: 0 0 2px; }
+.sub { color: var(--ink-3); font-size: 12px; margin: 0 0 16px; }
+
+.card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px; margin-bottom: 14px;
+}
+.card h2 {
+  font-size: 12px; font-weight: 600; color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: .04em; margin: 0 0 12px;
+}
+
+/* ---- 当前状态磁贴 ---- */
+.hero { display: flex; align-items: center; gap: 14px; }
+.dot {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--ink-3); flex: none;
+  box-shadow: 0 0 10px rgba(0,0,0,.25);
+}
+.dot.good   { background: var(--good); }
+.dot.warn   { background: var(--warn); }
+.dot.crit   { background: var(--crit); }
+.dot.blink-300 { animation: blink 0.3s steps(1) infinite; }
+.dot.blink-600 { animation: blink 0.6s steps(1) infinite; }
+.dot.breathe   { animation: breathe 4s ease-in-out infinite; }
+.dot.flash {
+  animation: flash 0.7s ease-out 1;
+}
+@keyframes blink { 50% { opacity: 0.15; } }
+@keyframes breathe { 0%,100% { opacity: .12; } 50% { opacity: 1; } }
+@keyframes flash { 0% { opacity: 1; } 60% { opacity: .1; } 100% { opacity: 1; } }
+.hero .name { font-size: 22px; font-weight: 650; line-height: 1.2; }
+.hero .meaning { font-size: 13px; color: var(--ink-2); margin-top: 2px; }
+
+/* ---- 板子信息 ---- */
+.meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.chip {
+  font-size: 12px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.chip b { color: var(--ink); font-weight: 600; }
+.chip.err { color: #fff; background: var(--crit); border-color: var(--crit); }
+
+/* ---- 控制按钮 ---- */
+.btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.btns button {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 14px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 7px;
+}
+.btns button:hover { border-color: var(--ink-3); }
+.btns button:active { transform: translateY(1px); }
+.btns button .pd {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3);
+}
+.btns button .pd.good { background: var(--good); }
+.btns button .pd.warn { background: var(--warn); }
+.btns button .pd.crit { background: var(--crit); }
+
+/* ---- WiFi 表单 ---- */
+details summary { font-size: 13px; color: var(--ink-2); cursor: pointer; }
+.wifiform { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.wifiform input {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--page); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; min-width: 0; flex: 1 1 140px;
+}
+.wifiform button {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 14px; cursor: pointer;
+}
+.hint { font-size: 12px; color: var(--ink-3); margin-top: 8px; }
+
+/* ---- 活动流 ---- */
+.feed { font-size: 12px; line-height: 1.7; }
+.feed div { display: flex; gap: 10px; border-bottom: 1px solid var(--grid); padding: 2px 0; }
+.feed .t {
+  color: var(--ink-3); flex: none; width: 52px;
+  font-variant-numeric: tabular-nums;
+}
+.feed .msg { color: var(--ink-2); word-break: break-all; }
+.feed .msg b { color: var(--ink); font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Claude 状态灯 · 监控台</h1>
+  <p class="sub">ESP8266 红绿灯 · 运行 <span id="uptime">…</span></p>
+
+  <div class="card">
+    <h2>当前状态</h2>
+    <div class="hero">
+      <div class="dot" id="hero-dot"></div>
+      <div>
+        <div class="name" id="hero-name">—</div>
+        <div class="meaning" id="hero-meaning">等待数据…</div>
+      </div>
+    </div>
+    <div class="meta" id="meta"></div>
+  </div>
+
+  <div class="card">
+    <h2>手动控制</h2>
+    <div class="btns" id="btns"></div>
+  </div>
+
+  <div class="card">
+    <h2>WiFi 配置</h2>
+    <details>
+      <summary>修改板子 WiFi 凭证（存 EEPROM）</summary>
+      <div class="wifiform">
+        <input id="wifi-ssid" placeholder="SSID">
+        <input id="wifi-pass" type="password" placeholder="密码">
+        <button id="wifi-save">保存并连接</button>
+      </div>
+      <p class="hint">保存后板子重启连接，串口会打印新 IP；把新 IP 写进
+      ~/.config/claude-light.conf 的 IP= 行并重启 claude-light 服务即可走 UDP。</p>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>最近活动</h2>
+    <div class="feed" id="feed">—</div>
+  </div>
+</div>
+
+<script>
+const FX = {
+  off:   { name: '关闭',     meaning: '灯全灭',                    cls: '',         anim: '' },
+  new:   { name: '新对话',   meaning: '红黄绿同闪一下 → 绿灯常亮',  cls: 'warn',     anim: 'flash' },
+  work:  { name: '处理中',   meaning: '黄灯常亮',                  cls: 'warn',     anim: '' },
+  wait:  { name: '等待确认', meaning: '黄灯闪烁',                  cls: 'warn',     anim: 'blink-600' },
+  error: { name: '出错',     meaning: '红灯闪烁',                  cls: 'crit',     anim: 'blink-300' },
+  idle:  { name: '空闲',     meaning: '绿灯常亮',                  cls: 'good',     anim: '' },
+  bye:   { name: '对话结束', meaning: '绿灯呼吸',                  cls: 'good',     anim: 'breathe' },
+};
+const BTN_ORDER = ['new', 'work', 'wait', 'error', 'idle', 'bye', 'off'];
+const BTN_LABEL = { new: '新对话', work: '处理中', wait: '等待', error: '出错', idle: '空闲', bye: '结束', off: '关闭' };
+
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// 控制按钮
+const btns = document.getElementById('btns');
+for (const fx of BTN_ORDER) {
+  const b = document.createElement('button');
+  b.innerHTML = `<span class="pd ${FX[fx].cls}"></span>${BTN_LABEL[fx]}`;
+  b.onclick = async () => {
+    await fetch('/api/cmd', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd: fx }) });
+    refresh();
+  };
+  btns.appendChild(b);
+}
+
+// WiFi 表单
+document.getElementById('wifi-save').onclick = async () => {
+  const ssid = document.getElementById('wifi-ssid').value.trim();
+  const pass = document.getElementById('wifi-pass').value;
+  if (!ssid) return;
+  await fetch('/api/cmd', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cmd: `wifi:${ssid}:${pass}` }) });
+  refresh();
+};
+
+function fmtUptime(s) {
+  const m = Math.floor(s / 60), h = Math.floor(m / 60);
+  return h > 0 ? `${h} 小时 ${m % 60} 分` : `${m} 分 ${s % 60} 秒`;
+}
+
+async function refresh() {
+  const st = await (await fetch('/api/status')).json();
+  const fx = FX[st.last_cmd] || null;
+
+  const dot = document.getElementById('hero-dot');
+  if (fx) {
+    dot.className = 'dot ' + fx.cls + (fx.anim ? ' ' + fx.anim : '');
+    document.getElementById('hero-name').textContent = fx.name;
+    document.getElementById('hero-meaning').textContent = fx.meaning;
+  } else {
+    dot.className = 'dot';
+    document.getElementById('hero-name').textContent = '—';
+    document.getElementById('hero-meaning').textContent = '等待第一条命令…';
+  }
+  document.getElementById('uptime').textContent = fmtUptime(st.uptime_s);
+
+  const chips = [];
+  chips.push(`板子上报 <b>${st.board_fx ? FX[st.board_fx].name : '—'}</b>`);
+  chips.push(`WiFi <b>${st.board_wifi || '未连接'}</b>`);
+  chips.push(`串口 <b>${st.serial_open ? '已连接' : '断开'}</b>`);
+  chips.push(`UDP <b>${st.udp_active ? '活跃' : '未用'}</b>`);
+  if (st.last_t) chips.push(`最近命令 <b>${st.last_t} ${esc(st.last_cmd)}</b>`);
+  const meta = document.getElementById('meta');
+  meta.innerHTML = chips.map(c => `<span class="chip">${c}</span>`).join('');
+  if (st.err_flag) meta.insertAdjacentHTML('afterbegin',
+    '<span class="chip err">● 本轮有错误</span>');
+
+  const feed = document.getElementById('feed');
+  feed.innerHTML = (st.activity || []).slice().reverse().map(([t, msg]) =>
+    `<div><span class="t">${t}</span><span class="msg">${esc(msg)}</span></div>`
+  ).join('') || '<div><span class="msg">暂无活动</span></div>';
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

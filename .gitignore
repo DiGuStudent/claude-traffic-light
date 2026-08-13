@@ -1,0 +1,7 @@
+# 本地运行配置（含设备 IP 等，不入库）
+host/claude-light.conf
+
+# 构建产物
+*.bin
+*.elf
+build/

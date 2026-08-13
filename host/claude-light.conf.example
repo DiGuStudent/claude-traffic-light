@@ -1,0 +1,12 @@
+# Claude Traffic Light 主机端配置
+# 复制为 ~/.config/claude-light.conf 并按需修改。
+# 板子通过 USB 数据线连接电脑时无需此文件（daemon 默认走串口）。
+# 板子连上 WiFi 后把 IP 填到 IP= 行，daemon 同时走 UDP（USB 可只供电）。
+
+# ESP8266 的 WiFi 地址（UDP 通道）
+IP=192.168.1.100
+PORT=8266
+SERIAL=/dev/ttyUSB0
+BAUD=115200
+# 监控后台端口（http://127.0.0.1:7800）
+WEB_PORT=7800

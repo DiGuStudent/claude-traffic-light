@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Claude Traffic Light 守护进程 + 监控后台
+
+持有串口/UDP 连接，把 hook 命令转发给 ESP8266 红绿灯，并内置
+本地监控后台（默认 http://127.0.0.1:7800）：
+  - 实时状态：当前灯效、板子状态（解析 STATUS 回复）、串口/UDP 链路
+  - 手动控灯按钮、WiFi 配置表单
+  - 最近活动流（命令、ACK、UDP 回执）
+
+Hook 入口脚本 claude-light 通过 unix socket 把命令发到这里，
+避免每次 hook 调用都重新打开串口（会触发板子复位）。
+
+配置 ~/.config/claude-light.conf（可选，无此文件则走串口）：
+  IP=192.168.1.100      # ESP8266 的 WiFi IP，配置后同时走 UDP
+  PORT=8266
+  SERIAL=/dev/ttyUSB0
+  BAUD=115200
+  WEB_PORT=7800         # 监控后台端口
+"""
+import json
+import os
+import select
+import socket
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser('~')
+RUN_DIR = os.path.join(HOME, '.cache', 'claude-light')
+SOCK_PATH = os.path.join(RUN_DIR, 'ctl.sock')
+LOG_PATH = os.path.join(RUN_DIR, 'daemon.log')
+CONF_PATH = os.path.join(HOME, '.config', 'claude-light.conf')
+WEB_HTML = os.path.join(HOME, '.config', 'claude-light-web.html')
+
+cfg = {'IP': None, 'PORT': 8266, 'SERIAL': '/dev/ttyUSB0',
+       'BAUD': 115200, 'WEB_PORT': 7800}
+
+FX_NAME = {0: 'off', 1: 'new', 2: 'work', 3: 'wait', 4: 'error', 5: 'idle', 6: 'bye'}
+ALLOWED_CMDS = {'new', 'work', 'wait', 'error', 'idle', 'bye', 'off', 'status'}
+
+# 共享状态（各线程读写，GIL 下够用）
+state = {
+    'last_cmd': None,     # 最近一条转发命令
+    'last_t': None,
+    'board_fx': None,     # 板子上报的灯效（解析 STATUS）
+    'board_wifi': None,   # 板子 WiFi IP（解析 STATUS / UDP ready）
+    'serial_open': False,
+    'udp_active': False,  # 配置了 IP 且成功发过包
+    'start_t': time.time(),
+}
+activity = deque(maxlen=200)  # (时间, 文本)
+
+
+def log(msg, ring=True):
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    try:
+        with open(LOG_PATH, 'a') as f:
+            f.write(line + '\n')
+    except OSError:
+        pass
+    if ring:
+        activity.append((time.strftime('%H:%M:%S'), msg))
+
+
+def load_conf():
+    try:
+        with open(CONF_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    k, v = k.strip(), v.strip()
+                    if k == 'IP':
+                        cfg['IP'] = v
+                    elif k == 'PORT':
+                        cfg['PORT'] = int(v)
+                    elif k == 'SERIAL':
+                        cfg['SERIAL'] = v
+                    elif k == 'BAUD':
+                        cfg['BAUD'] = int(v)
+                    elif k == 'WEB_PORT':
+                        cfg['WEB_PORT'] = int(v)
+    except FileNotFoundError:
+        pass
+
+
+def process_board_line(line):
+    """解析板子串口/UDP 输出行"""
+    if line.startswith('STATUS '):
+        # STATUS fx=N wifi=<ip|off>
+        try:
+            fx = int(line.split('fx=')[1].split()[0])
+            state['board_fx'] = FX_NAME.get(fx, str(fx))
+        except (IndexError, ValueError):
+            pass
+        try:
+            wifi = line.split('wifi=')[1].strip()
+            state['board_wifi'] = None if wifi == 'off' else wifi
+        except IndexError:
+            pass
+    elif line.startswith('UDP ready, IP='):
+        state['board_wifi'] = line.split('=')[1].strip()
+
+
+class SerialLink:
+    """串口链路：打开一次长期持有，掉线自动重连（不阻塞命令转发）"""
+
+    def __init__(self):
+        self.fd = None
+        self.lock = threading.Lock()
+
+    def _open(self):
+        fd = os.open(cfg['SERIAL'], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        import termios
+        a = termios.tcgetattr(fd)
+        a[3] &= ~termios.ICANON
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+        return fd
+
+    def ensure(self):
+        if self.fd is not None:
+            return True
+        with self.lock:
+            if self.fd is not None:
+                return True
+            try:
+                self.fd = self._open()
+                state['serial_open'] = True
+                log(f"serial open {cfg['SERIAL']}@{cfg['BAUD']}")
+                # 板子可能刚复位，稍后查询一次状态填充监控台
+                threading.Thread(target=self._startup_status, daemon=True).start()
+                return True
+            except OSError as e:
+                log(f"serial open failed: {e}")
+                return False
+
+    def _startup_status(self):
+        time.sleep(3)
+        try:
+            if self.fd is not None:
+                os.write(self.fd, b'status\n')
+        except OSError:
+            pass
+
+    def send(self, cmd):
+        if not self.ensure():
+            return False
+        try:
+            os.write(self.fd, (cmd + '\n').encode())
+            return True
+        except OSError:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+            state['serial_open'] = False
+            return False
+
+    def read_loop(self):
+        """读串口输出，按行重组后解析/记录。
+
+        连续相同的行折叠计数（宿主串口驱动可能瞬时重放同一数据，
+        实测曾以 22k 行/秒刷爆日志），每 2 秒最多记录一条重复行。
+        """
+        buf = b''
+        last_line = None
+        repeat = 0
+        last_flush = 0.0
+        while True:
+            if self.fd is None:
+                self.ensure()
+                time.sleep(3)
+                continue
+            try:
+                r, _, _ = select.select([self.fd], [], [], 1.0)
+                if r:
+                    data = os.read(self.fd, 256)
+                    if data:
+                        buf += data
+                        while b'\n' in buf:
+                            raw, buf = buf.split(b'\n', 1)
+                            line = raw.decode(errors='replace').strip()
+                            if not line:
+                                continue
+                            now = time.time()
+                            if line == last_line:
+                                repeat += 1
+                                if now - last_flush >= 2.0:
+                                    log(f'rx: {line} (×{repeat} 重复)')
+                                    last_flush = now
+                                continue
+                            if repeat > 1:
+                                log(f'rx: {last_line} (×{repeat} 重复)')
+                            last_line, repeat, last_flush = line, 1, now
+                            log('rx: ' + line)
+                            process_board_line(line)
+                    else:
+                        raise OSError('EOF')
+            except (OSError, BlockingIOError):
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+                state['serial_open'] = False
+                log('serial closed, will retry')
+
+
+serial = None  # SerialLink 实例，main() 中创建
+udp_sock = None
+
+
+def udp_send(cmd):
+    global udp_sock
+    if not cfg['IP']:
+        return
+    try:
+        if udp_sock is None:
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.bind(('0.0.0.0', 0))
+        udp_sock.sendto(cmd.encode(), (cfg['IP'], cfg['PORT']))
+        state['udp_active'] = True
+    except OSError as e:
+        log(f'udp send failed: {e}')
+
+
+def udp_read_loop():
+    """读板子回的 UDP ACK，按行解析/记录"""
+    while True:
+        if udp_sock is None:
+            time.sleep(1)
+            continue
+        try:
+            r, _, _ = select.select([udp_sock], [], [], 1.0)
+            if r:
+                data, addr = udp_sock.recvfrom(128)
+                line = data.decode(errors='replace').strip()
+                log(f'udp ack {addr[0]}: {line}')
+                process_board_line(line)
+        except OSError:
+            time.sleep(1)
+
+
+def dispatch(cmd, src='cmd'):
+    """转发命令到板子：串口优先（低延迟、可回读 ACK），串口不可用时 UDP 兜底"""
+    log(f'{src}: {cmd}')
+    state['last_cmd'] = cmd
+    state['last_t'] = time.strftime('%H:%M:%S')
+    if not serial.send(cmd):
+        udp_send(cmd)
+
+
+# ---------- unix socket（hook 入口用） ----------
+def handle_conn(conn, serial):
+    try:
+        data = conn.recv(64).decode(errors='replace').strip()
+        if data:
+            dispatch(data)
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+
+def sock_loop(serial):
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o600)
+    srv.listen(8)
+    while True:
+        try:
+            conn, _ = srv.accept()
+            threading.Thread(target=handle_conn, args=(conn, serial), daemon=True).start()
+        except OSError:
+            time.sleep(1)
+
+
+# ---------- 监控后台 ----------
+class WebHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # 转发到 daemon 日志
+        log('web: ' + fmt % args)
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            try:
+                with open(WEB_HTML, 'rb') as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except FileNotFoundError:
+                self._json({'error': 'web.html not found'}, 500)
+        elif self.path == '/api/status':
+            self._json({
+                'time': time.strftime('%H:%M:%S'),
+                'last_cmd': state['last_cmd'],
+                'last_t': state['last_t'],
+                'board_fx': state['board_fx'],
+                'board_wifi': state['board_wifi'],
+                'serial_open': state['serial_open'],
+                'udp_active': state['udp_active'],
+                'err_flag': any(n.startswith('err.') for n in os.listdir(RUN_DIR)),
+                'uptime_s': int(time.time() - state['start_t']),
+                'activity': list(activity)[-50:],
+            })
+        elif self.path == '/api/logs':
+            self._json({'daemon': tail_file(LOG_PATH, 80)})
+        else:
+            self._json({'error': 'not found'}, 404)
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length) or b'{}')
+            cmd = (body.get('cmd') or '').strip()
+            if cmd in ALLOWED_CMDS or cmd.startswith('wifi:'):
+                dispatch(cmd, src='web')
+                self._json({'ok': True, 'cmd': cmd})
+            else:
+                self._json({'ok': False, 'error': f'invalid cmd: {cmd!r}'}, 400)
+        except (ValueError, OSError) as e:
+            self._json({'ok': False, 'error': str(e)}, 400)
+
+
+def tail_file(path, n):
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+        return [l.rstrip('\n') for l in lines[-n:]]
+    except OSError:
+        return []
+
+
+def web_loop():
+    srv = ThreadingHTTPServer(('127.0.0.1', cfg['WEB_PORT']), WebHandler)
+    log(f'web console on http://127.0.0.1:{cfg["WEB_PORT"]}')
+    srv.serve_forever()
+
+
+def rotate_log():
+    """日志超过 1MB 时轮转一份（只保留 1 代）"""
+    try:
+        if os.path.getsize(LOG_PATH) > 1024 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + '.1')
+    except OSError:
+        pass
+
+
+def main():
+    global serial
+    load_conf()
+    os.makedirs(RUN_DIR, exist_ok=True)
+    rotate_log()
+    try:
+        os.unlink(SOCK_PATH)
+    except FileNotFoundError:
+        pass
+
+    serial = SerialLink()
+    threading.Thread(target=serial.read_loop, daemon=True).start()
+    threading.Thread(target=udp_read_loop, daemon=True).start()
+    threading.Thread(target=sock_loop, args=(serial,), daemon=True).start()
+    threading.Thread(target=web_loop, daemon=True).start()
+
+    log(f'claude-lightd started ip={cfg["IP"] or "serial-only"} '
+        f'web={cfg["WEB_PORT"]}')
+    while True:
+        time.sleep(60)
+
+
+if __name__ == '__main__':
+    main()

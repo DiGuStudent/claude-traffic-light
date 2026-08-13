@@ -1,0 +1,10 @@
+{
+  "name": "opencode-claude-light",
+  "version": "1.0.0",
+  "description": "Claude Traffic Light: 把 opencode 会话状态映射到 ESP8266 红绿灯",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}
